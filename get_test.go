@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/go-cmp/cmp"
 	testing_helper "github.com/hashicorp/go-getter/v2/helper/testing"
@@ -832,5 +833,119 @@ func TestGetForcedGetter(t *testing.T) {
 				t.Errorf("getForcedGetter() got1 = %v, want %v", got1, tt.want1)
 			}
 		})
+	}
+}
+
+func TestGetFile_archiveDst(t *testing.T) {
+	ctx := context.Background()
+
+	td := t.TempDir()
+	dst := filepath.Join(td, "single")
+	archiveDst := filepath.Join(td, "single.gz")
+	u := testModule("decompress-gz/single.gz") + "?checksum=md5:54587ecaf81a093677084d6554598bd6"
+
+	getter := &MockGetter{Proxy: new(FileGetter)}
+	req := &Request{
+		Src:        u,
+		Dst:        dst,
+		ArchiveDst: archiveDst,
+		GetMode:    ModeFile,
+		Copy:       true,
+	}
+	client := &Client{
+		Getters: []Getter{getter},
+	}
+
+	// get and decompress the archive
+	op, err := client.Get(ctx, req)
+	if err != nil {
+		t.Fatalf("err: %s", err)
+	}
+	if diff := cmp.Diff(&GetResult{Dst: dst}, op); diff != "" {
+		t.Fatalf("unexpected op: %s", diff)
+	}
+	assertContents(t, dst, "foo\n")
+	archiveFi, err := os.Stat(archiveDst)
+	if err != nil {
+		t.Fatalf("archive should be kept: %s", err)
+	}
+	fi, err := os.Stat(dst)
+	if err != nil {
+		t.Fatalf("err: %s", err)
+	}
+	if !fi.ModTime().Equal(archiveFi.ModTime()) {
+		t.Fatalf("modification time %s should match the archive %s", fi.ModTime(), archiveFi.ModTime())
+	}
+
+	// The kept archive passes the checksum and dst is current, so neither
+	// get nor decompress again.
+	getter.Proxy = nil
+	getter.GetFileCalled = false
+	if err := os.WriteFile(dst, []byte("bar\n"), 0644); err != nil {
+		t.Fatalf("err: %s", err)
+	}
+	if err := os.Chtimes(dst, archiveFi.ModTime(), archiveFi.ModTime()); err != nil {
+		t.Fatalf("err: %s", err)
+	}
+	req = &Request{Src: u, Dst: dst, ArchiveDst: archiveDst, GetMode: ModeFile}
+	if _, err := client.Get(ctx, req); err != nil {
+		t.Fatalf("err: %s", err)
+	}
+	if getter.GetFileCalled {
+		t.Fatalf("get should not have been called")
+	}
+	assertContents(t, dst, "bar\n")
+
+	// dst changed after decompression, so decompress again.
+	if err := os.Chtimes(dst, archiveFi.ModTime(), archiveFi.ModTime().Add(time.Second)); err != nil {
+		t.Fatalf("err: %s", err)
+	}
+	req = &Request{Src: u, Dst: dst, ArchiveDst: archiveDst, GetMode: ModeFile}
+	if _, err := client.Get(ctx, req); err != nil {
+		t.Fatalf("err: %s", err)
+	}
+	if getter.GetFileCalled {
+		t.Fatalf("get should not have been called")
+	}
+	assertContents(t, dst, "foo\n")
+}
+
+func TestClient_ArchiveType(t *testing.T) {
+	cases := []struct {
+		src  string
+		want string
+	}{
+		{"https://example.com/foo.img", ""},
+		{"https://example.com/foo.img.xz", "xz"},
+		{"https://example.com/foo.tar.gz?checksum=file:https://example.com/SHA256SUMS", "tar.gz"},
+		{"https://example.com/foo.tgz?archive=false", ""},
+		{"https://example.com/foo?archive=zip", "zip"},
+		{"https://example.com/foo?archive=unknown", ""},
+		{"http::https://example.com/foo.zip//subdir?ref=v1", "zip"},
+		{"/local/path/foo.zst", "zst"},
+	}
+
+	client := &Client{}
+	for _, tc := range cases {
+		t.Run(tc.src, func(t *testing.T) {
+			got, err := client.ArchiveType(tc.src)
+			if err != nil {
+				t.Fatalf("err: %s", err)
+			}
+			if got != tc.want {
+				t.Fatalf("got %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func assertContents(t *testing.T, path string, contents string) {
+	t.Helper()
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("err: %s", err)
+	}
+	if string(b) != contents {
+		t.Fatalf("bad contents of %s: %q, want %q", path, b, contents)
 	}
 }

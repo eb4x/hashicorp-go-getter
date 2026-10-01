@@ -54,6 +54,19 @@ type Request struct {
 	// over Copy.
 	Inplace bool
 
+	// ArchiveDst, if set, is the path where an archive is kept when the source
+	// is decompressed. By default the archive is downloaded to a temporary
+	// directory and removed after decompression. With ArchiveDst set, a later
+	// Get of the same source can skip the download when the kept archive
+	// still matches the source checksum.
+	//
+	// When decompressing to a single file, the modification time of Dst is
+	// set to that of the archive. A later Get skips decompression while Dst
+	// and the archive still have the same modification time.
+	//
+	// ArchiveDst is ignored when the source is not decompressed.
+	ArchiveDst string
+
 	// ProgressListener allows to track file downloads.
 	// By default a no op progress listener is used.
 	ProgressListener ProgressTracker

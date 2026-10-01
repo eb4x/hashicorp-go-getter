@@ -4,10 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	urlhelper "github.com/hashicorp/go-getter/v2/helper/url"
 	"github.com/hashicorp/go-multierror"
@@ -149,50 +151,39 @@ func (c *Client) get(ctx context.Context, req *Request, g Getter) (*GetResult, *
 	q := req.u.Query()
 
 	// Determine if we have an archive type
-	archiveV := q.Get("archive")
-	if archiveV != "" {
+	archiveV := c.archiveType(req.u)
+	if q.Get("archive") != "" {
 		// Delete the parameter since it is a magic parameter we don't
 		// want to pass on to the Getter
 		q.Del("archive")
 		req.u.RawQuery = q.Encode()
-
-		// If we can parse the value as a bool and it is false, then
-		// set the archive to "-" which should never map to a decompressor
-		if b, err := strconv.ParseBool(archiveV); err == nil && !b {
-			archiveV = "-"
-		}
-	} else {
-		// We don't appear to... but is it part of the filename?
-		matchingLen := 0
-		for k := range c.Decompressors {
-			if strings.HasSuffix(req.u.Path, "."+k) && len(k) > matchingLen {
-				archiveV = k
-				matchingLen = len(k)
-			}
-		}
 	}
 
 	// If we have a decompressor, then we need to change the destination
-	// to download to a temporary path. We unarchive this into the final,
+	// to download to the archive path. We unarchive this into the final,
 	// real path.
 	var decompressDst string
 	var decompressDir bool
 	decompressor := c.Decompressors[archiveV]
 	if decompressor != nil {
-		// Create a temporary directory to store our archive. We delete
-		// this at the end of everything.
-		td, err := os.MkdirTemp("", "getter")
-		if err != nil {
-			return nil, &getError{true, fmt.Errorf(
-				"Error creating temporary directory for archive: %s", err)}
-		}
-		defer os.RemoveAll(td)
-
-		// Swap the download directory to be our temporary path and
+		// Swap the download directory to be the archive path and
 		// store the old values.
 		decompressDst = req.Dst
 		decompressDir = req.GetMode != ModeFile
-		req.Dst = filepath.Join(td, "archive")
+		if req.ArchiveDst != "" {
+			req.Dst = req.ArchiveDst
+		} else {
+			// Create a temporary directory to store our archive. We delete
+			// this at the end of everything.
+			td, err := os.MkdirTemp("", "getter")
+			if err != nil {
+				return nil, &getError{true, fmt.Errorf(
+					"Error creating temporary directory for archive: %s", err)}
+			}
+			defer os.RemoveAll(td)
+
+			req.Dst = filepath.Join(td, "archive")
+		}
 		req.GetMode = ModeFile
 	}
 
@@ -258,11 +249,32 @@ func (c *Client) get(ctx context.Context, req *Request, g Getter) (*GetResult, *
 		}
 
 		if decompressor != nil {
-			// We have a decompressor, so decompress the current destination
-			// into the final destination with the proper mode.
-			err := decompressor.Decompress(decompressDst, req.Dst, decompressDir, req.umask())
-			if err != nil {
-				return nil, &getError{true, err}
+			// A kept archive marks the single file it was decompressed to
+			// with its own modification time, so an unchanged archive does
+			// not need to be decompressed again.
+			var archiveModTime time.Time
+			keepArchive := req.ArchiveDst != "" && !decompressDir
+			if keepArchive {
+				fi, err := os.Stat(req.Dst)
+				if err != nil {
+					return nil, &getError{true, err}
+				}
+				archiveModTime = fi.ModTime()
+			}
+
+			if !keepArchive || !modTimeEqual(decompressDst, archiveModTime) {
+				// We have a decompressor, so decompress the current destination
+				// into the final destination with the proper mode.
+				err := decompressor.Decompress(decompressDst, req.Dst, decompressDir, req.umask())
+				if err != nil {
+					return nil, &getError{true, err}
+				}
+
+				if keepArchive {
+					if err := os.Chtimes(decompressDst, time.Time{}, archiveModTime); err != nil {
+						return nil, &getError{true, err}
+					}
+				}
 			}
 
 			// Swap the information back
@@ -327,30 +339,63 @@ func (c *Client) get(ctx context.Context, req *Request, g Getter) (*GetResult, *
 
 }
 
-func (c *Client) checkArchive(req *Request) string {
-	q := req.u.Query()
-	archiveV := q.Get("archive")
-	if archiveV != "" {
-		// Delete the paramter since it is a magic parameter we don't
-		// want to pass on to the Getter
-		q.Del("archive")
-		req.u.RawQuery = q.Encode()
+// ArchiveType returns the key of the decompressor that Get would use for src,
+// either from the "archive" query parameter or from the file extension. It
+// returns an empty string when src would not be decompressed.
+//
+// src may carry a forced getter prefix and a subdirectory, as accepted by Get.
+func (c *Client) ArchiveType(src string) (string, error) {
+	_, src = getForcedGetter(src)
+	src, _ = SourceDirSubdir(src)
+	u, err := urlhelper.Parse(src)
+	if err != nil {
+		return "", err
+	}
+	archiveV := c.archiveType(u)
+	if _, ok := c.decompressors()[archiveV]; !ok {
+		return "", nil
+	}
+	return archiveV, nil
+}
 
+// archiveType returns the archive type for u without modifying it. The
+// result may not map to a decompressor.
+func (c *Client) archiveType(u *url.URL) string {
+	archiveV := u.Query().Get("archive")
+	if archiveV != "" {
 		// If we can parse the value as a bool and it is false, then
 		// set the archive to "-" which should never map to a decompressor
 		if b, err := strconv.ParseBool(archiveV); err == nil && !b {
 			archiveV = "-"
 		}
+		return archiveV
 	}
-	if archiveV == "" {
-		// We don't appear to... but is it part of the filename?
-		matchingLen := 0
-		for k := range c.Decompressors {
-			if strings.HasSuffix(req.u.Path, "."+k) && len(k) > matchingLen {
-				archiveV = k
-				matchingLen = len(k)
-			}
+
+	// We don't appear to... but is it part of the filename?
+	matchingLen := 0
+	for k := range c.decompressors() {
+		if strings.HasSuffix(u.Path, "."+k) && len(k) > matchingLen {
+			archiveV = k
+			matchingLen = len(k)
 		}
 	}
 	return archiveV
+}
+
+// decompressors returns the decompressors of the client, or the default ones
+// when the client has not been configured yet.
+func (c *Client) decompressors() map[string]Decompressor {
+	if c.Decompressors == nil {
+		return Decompressors
+	}
+	return c.Decompressors
+}
+
+// modTimeEqual reports whether path is a regular file with modification time t.
+func modTimeEqual(path string, t time.Time) bool {
+	fi, err := os.Stat(path)
+	if err != nil {
+		return false
+	}
+	return fi.Mode().IsRegular() && fi.ModTime().Equal(t)
 }
