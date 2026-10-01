@@ -1,6 +1,8 @@
 package getter
 
 import (
+	"bytes"
+	"compress/gzip"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -16,7 +18,9 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	cleanhttp "github.com/hashicorp/go-cleanhttp"
 	testing_helper "github.com/hashicorp/go-getter/v2/helper/testing"
@@ -291,6 +295,10 @@ func TestHttpGetter_resume(t *testing.T) {
 	if err := f.Close(); err != nil {
 		t.Fatalf("close failed: %s", err)
 	}
+	// Mark the partial file as coming from the same remote file.
+	if err := os.Chtimes(dst, testHttpModTime, testHttpModTime); err != nil {
+		t.Fatalf("chtimes failed: %s", err)
+	}
 
 	u := url.URL{
 		Scheme:   "http",
@@ -348,6 +356,10 @@ func TestHttpGetter_resumeNoRange(t *testing.T) {
 	if err := f.Close(); err != nil {
 		t.Fatalf("close failed: %s", err)
 	}
+	// Mark the partial file as coming from the same remote file.
+	if err := os.Chtimes(dst, testHttpModTime, testHttpModTime); err != nil {
+		t.Fatalf("chtimes failed: %s", err)
+	}
 
 	u := url.URL{
 		Scheme:   "http",
@@ -370,6 +382,384 @@ func TestHttpGetter_resumeNoRange(t *testing.T) {
 
 	if string(b) != string(load) {
 		t.Fatalf("file differs: got:\n%s\n expected:\n%s\n", string(b), string(load))
+	}
+}
+
+// An existing destination is only kept or resumed when its modification time
+// matches the Last-Modified time of the remote file.
+func TestHttpGetter_GetFileExisting(t *testing.T) {
+	load := testHttpMetaStr
+	staleTime := testHttpModTime.Add(-time.Hour)
+
+	tc := []struct {
+		name         string
+		existing     string
+		existingTime time.Time
+		noHead       bool
+		emptyHead    bool
+		noGet        bool
+		wantRange    string
+		wantIfRange  string
+	}{
+		{name: "current", existing: load, existingTime: testHttpModTime, noGet: true},
+		{name: "current-empty-head", existing: "", existingTime: testHttpModTime, emptyHead: true},
+		{name: "current-prefix", existing: load[:10], existingTime: testHttpModTime, wantRange: "bytes=10-", wantIfRange: testHttpModTime.Format(http.TimeFormat)},
+		{name: "stale-prefix", existing: "xxxxxxxxxx", existingTime: staleTime},
+		{name: "stale-same-size", existing: strings.Repeat("x", len(load)), existingTime: staleTime},
+		{name: "stale-larger", existing: load + "trailing", existingTime: staleTime},
+		{name: "current-larger", existing: load + "trailing", existingTime: testHttpModTime},
+		{name: "no-head-larger", existing: load + "trailing", existingTime: testHttpModTime, noHead: true},
+	}
+
+	for _, tt := range tc {
+		t.Run(tt.name, func(t *testing.T) {
+			var mu sync.Mutex
+			var gets []http.Header
+			dst := testHttpExistingFile(t, tt.existing, tt.existingTime)
+			req := testHttpFileRequest(t, dst, func(w http.ResponseWriter, r *http.Request) {
+				if r.Method == "GET" {
+					mu.Lock()
+					gets = append(gets, r.Header.Clone())
+					mu.Unlock()
+				}
+				if tt.emptyHead && r.Method == "HEAD" {
+					// Some servers report no size for HEAD requests (#538).
+					w.Header().Set("Accept-Ranges", "bytes")
+					w.Header().Set("Last-Modified", testHttpModTime.Format(http.TimeFormat))
+					w.Header().Set("Content-Length", "0")
+					return
+				}
+				http.ServeContent(w, r, "file", testHttpModTime, strings.NewReader(load))
+			})
+
+			g := &HttpGetter{DoNotCheckHeadFirst: tt.noHead}
+			if err := g.GetFile(context.Background(), req); err != nil {
+				t.Fatalf("err: %s", err)
+			}
+			testing_helper.AssertContents(t, dst, load)
+			testHttpAssertModTime(t, dst, testHttpModTime)
+
+			mu.Lock()
+			defer mu.Unlock()
+			wantGets := 1
+			if tt.noGet {
+				wantGets = 0
+			}
+			if len(gets) != wantGets {
+				t.Fatalf("got %d GET requests, want %d", len(gets), wantGets)
+			}
+			if wantGets == 1 && (gets[0].Get("Range") != tt.wantRange || gets[0].Get("If-Range") != tt.wantIfRange) {
+				t.Fatalf("bad GET request: got Range %q, If-Range %q, want %q, %q",
+					gets[0].Get("Range"), gets[0].Get("If-Range"), tt.wantRange, tt.wantIfRange)
+			}
+		})
+	}
+}
+
+// A server that ignores the range request sends the whole file, which
+// replaces the existing content.
+func TestHttpGetter_GetFileRangeIgnored(t *testing.T) {
+	load := testHttpMetaStr
+	dst := testHttpExistingFile(t, load[:10], testHttpModTime)
+	req := testHttpFileRequest(t, dst, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Accept-Ranges", "bytes")
+		w.Header().Set("Last-Modified", testHttpModTime.Format(http.TimeFormat))
+		w.Header().Set("Content-Length", strconv.Itoa(len(load)))
+		if r.Method == "GET" {
+			w.Write([]byte(load))
+		}
+	})
+
+	if err := new(HttpGetter).GetFile(context.Background(), req); err != nil {
+		t.Fatalf("err: %s", err)
+	}
+	testing_helper.AssertContents(t, dst, load)
+}
+
+// A partial response must continue the existing file up to the end of the
+// remote file, and come from the remote file that the existing bytes came
+// from. A server may also send the whole file as partial content. A rejected
+// response drops the existing bytes, so that the next call starts over.
+func TestHttpGetter_GetFilePartialContent(t *testing.T) {
+	load := testHttpMetaStr
+	n := len(load)
+	rest := fmt.Sprintf("bytes 10-%d/%d", n-1, n)
+	otherTime := testHttpModTime.Add(time.Hour).Format(http.TimeFormat)
+
+	tc := []struct {
+		name         string
+		existing     string
+		contentRange string
+		body         string
+		lastModified string
+		date         string
+		chunked      bool
+		errExpected  bool
+		stamped      bool
+	}{
+		{name: "resume", existing: load[:10], contentRange: rest, body: load[10:], stamped: true},
+		{name: "resume-same-last-modified", existing: load[:10], contentRange: rest, body: load[10:], lastModified: testHttpModTime.Format(http.TimeFormat), stamped: true},
+		{name: "resume-chunked-long", existing: load[:10], contentRange: rest, body: load[10:] + "xxx", chunked: true, stamped: true},
+		{name: "whole-file", contentRange: fmt.Sprintf("bytes 0-%d/%d", n-1, n), body: load},
+		{name: "wrong-start", existing: load[:10], contentRange: fmt.Sprintf("bytes 5-%d/%d", n-1, n), body: load[5:], errExpected: true},
+		{name: "short", existing: load[:10], contentRange: fmt.Sprintf("bytes 10-%d/%d", n-2, n), body: load[10 : n-1], errExpected: true},
+		{name: "long", existing: load[:10], contentRange: rest, body: load[10:] + "xxx", errExpected: true},
+		{name: "wrong-size", existing: load[:10], contentRange: fmt.Sprintf("bytes 10-%d/%d", n, n+1), body: load[10:] + "x", errExpected: true},
+		{name: "unknown-size", existing: load[:10], contentRange: fmt.Sprintf("bytes 10-%d/*", n-1), body: load[10:], errExpected: true},
+		{name: "other-last-modified", existing: load[:10], contentRange: rest, body: load[10:], lastModified: otherTime, errExpected: true},
+		{name: "weak-last-modified", existing: load[:10], contentRange: rest, body: load[10:], lastModified: otherTime, date: otherTime, errExpected: true},
+	}
+
+	for _, tt := range tc {
+		t.Run(tt.name, func(t *testing.T) {
+			dst := testHttpExistingFile(t, tt.existing, testHttpModTime)
+			req := testHttpFileRequest(t, dst, func(w http.ResponseWriter, r *http.Request) {
+				if r.Method == "HEAD" {
+					http.ServeContent(w, r, "file", testHttpModTime, strings.NewReader(load))
+					return
+				}
+				if tt.lastModified != "" {
+					w.Header().Set("Last-Modified", tt.lastModified)
+				}
+				if tt.date != "" {
+					w.Header().Set("Date", tt.date)
+				}
+				w.Header().Set("Content-Range", tt.contentRange)
+				if !tt.chunked {
+					w.Header().Set("Content-Length", strconv.Itoa(len(tt.body)))
+				}
+				w.WriteHeader(http.StatusPartialContent)
+				if tt.chunked {
+					// Send the headers without a Content-Length.
+					w.(http.Flusher).Flush()
+				}
+				w.Write([]byte(tt.body))
+			})
+
+			err := new(HttpGetter).GetFile(context.Background(), req)
+			if tt.errExpected != (err != nil) {
+				t.Fatalf("err: %v", err)
+			}
+			if tt.errExpected {
+				testing_helper.AssertContents(t, dst, "")
+			} else {
+				testing_helper.AssertContents(t, dst, load)
+			}
+			if tt.stamped {
+				testHttpAssertModTime(t, dst, testHttpModTime)
+			} else {
+				testHttpAssertNotModTime(t, dst, testHttpModTime)
+			}
+		})
+	}
+}
+
+// After a rejected partial response, the next call downloads the whole file.
+func TestHttpGetter_GetFilePartialContentRetry(t *testing.T) {
+	load := testHttpMetaStr
+	dst := testHttpExistingFile(t, load[:10], testHttpModTime)
+	req := testHttpFileRequest(t, dst, func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Range") != "" {
+			// Answer every range request with the whole file.
+			w.Header().Set("Content-Range", fmt.Sprintf("bytes 0-%d/%d", len(load)-1, len(load)))
+			w.WriteHeader(http.StatusPartialContent)
+			w.Write([]byte(load))
+			return
+		}
+		http.ServeContent(w, r, "file", testHttpModTime, strings.NewReader(load))
+	})
+
+	g := new(HttpGetter)
+	if err := g.GetFile(context.Background(), req); err == nil {
+		t.Fatal("expected error")
+	}
+	if err := g.GetFile(context.Background(), req); err != nil {
+		t.Fatalf("err: %s", err)
+	}
+	testing_helper.AssertContents(t, dst, load)
+	testHttpAssertModTime(t, dst, testHttpModTime)
+}
+
+// A remote file that changes between the HEAD and GET requests is downloaded
+// again. The destination gets the earlier Last-Modified time of the HEAD
+// request, so the next call, whose HEAD request reports the new time,
+// downloads it once more.
+func TestHttpGetter_GetFileChanged(t *testing.T) {
+	oldLoad := testHttpMetaStr
+	newLoad := strings.ToUpper(testHttpMetaStr)
+	newModTime := testHttpModTime.Add(time.Hour)
+
+	dst := testHttpExistingFile(t, oldLoad[:10], testHttpModTime)
+	req := testHttpFileRequest(t, dst, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == "HEAD" {
+			http.ServeContent(w, r, "file", testHttpModTime, strings.NewReader(oldLoad))
+			return
+		}
+		http.ServeContent(w, r, "file", newModTime, strings.NewReader(newLoad))
+	})
+
+	if err := new(HttpGetter).GetFile(context.Background(), req); err != nil {
+		t.Fatalf("err: %s", err)
+	}
+	testing_helper.AssertContents(t, dst, newLoad)
+	testHttpAssertModTime(t, dst, testHttpModTime)
+}
+
+// The GET request may be redirected to another server (a CDN) that reports
+// another Last-Modified time for the same file than the HEAD request. The
+// destination gets the earlier time: a later GET time must not cause a
+// download on every call, and an earlier one (a stale cache) must not be kept.
+func TestHttpGetter_GetFileLastModifiedDiffers(t *testing.T) {
+	load := testHttpMetaStr
+
+	tc := []struct {
+		name        string
+		getModTime  time.Time
+		wantModTime time.Time
+		wantGets    int
+	}{
+		{name: "later-get", getModTime: testHttpModTime.Add(3 * time.Second), wantModTime: testHttpModTime, wantGets: 1},
+		{name: "earlier-get", getModTime: testHttpModTime.Add(-time.Hour), wantModTime: testHttpModTime.Add(-time.Hour), wantGets: 2},
+	}
+
+	for _, tt := range tc {
+		t.Run(tt.name, func(t *testing.T) {
+			var mu sync.Mutex
+			var gets int
+			dst := filepath.Join(t.TempDir(), "file")
+			req := testHttpFileRequest(t, dst, func(w http.ResponseWriter, r *http.Request) {
+				if r.Method == "HEAD" {
+					http.ServeContent(w, r, "file", testHttpModTime, strings.NewReader(load))
+					return
+				}
+				mu.Lock()
+				gets++
+				mu.Unlock()
+				http.ServeContent(w, r, "file", tt.getModTime, strings.NewReader(load))
+			})
+
+			g := new(HttpGetter)
+			for i := 0; i < 2; i++ {
+				if err := g.GetFile(context.Background(), req); err != nil {
+					t.Fatalf("err: %s", err)
+				}
+			}
+			testing_helper.AssertContents(t, dst, load)
+			testHttpAssertModTime(t, dst, tt.wantModTime)
+
+			mu.Lock()
+			defer mu.Unlock()
+			if gets != tt.wantGets {
+				t.Fatalf("got %d GET requests, want %d", gets, tt.wantGets)
+			}
+		})
+	}
+}
+
+// A body that the Transport decompressed differs from the remote bytes, so it
+// is not marked as (a prefix of) the remote file.
+func TestHttpGetter_GetFileGzip(t *testing.T) {
+	load := testHttpMetaStr
+	var gz bytes.Buffer
+	zw := gzip.NewWriter(&gz)
+	if _, err := zw.Write([]byte(load)); err != nil {
+		t.Fatalf("err: %s", err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatalf("err: %s", err)
+	}
+
+	dst := filepath.Join(t.TempDir(), "file")
+	req := testHttpFileRequest(t, dst, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Encoding", "gzip")
+		http.ServeContent(w, r, "file", testHttpModTime, bytes.NewReader(gz.Bytes()))
+	})
+
+	if err := new(HttpGetter).GetFile(context.Background(), req); err != nil {
+		t.Fatalf("err: %s", err)
+	}
+	testing_helper.AssertContents(t, dst, load)
+	testHttpAssertNotModTime(t, dst, testHttpModTime)
+}
+
+// An interrupted download keeps the Last-Modified time of the remote file, so
+// that the next call resumes it.
+func TestHttpGetter_GetFileInterrupted(t *testing.T) {
+	load := testHttpMetaStr
+	dst := filepath.Join(t.TempDir(), "file")
+	req := testHttpFileRequest(t, dst, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == "GET" && r.Header.Get("Range") == "" {
+			// Send the first 10 bytes and drop the connection. Flush, so that
+			// the client receives them before the abort.
+			w.Header().Set("Last-Modified", testHttpModTime.Format(http.TimeFormat))
+			w.Header().Set("Content-Length", strconv.Itoa(len(load)))
+			w.Write([]byte(load[:10]))
+			w.(http.Flusher).Flush()
+			panic(http.ErrAbortHandler)
+		}
+		http.ServeContent(w, r, "file", testHttpModTime, strings.NewReader(load))
+	})
+
+	g := new(HttpGetter)
+	if err := g.GetFile(context.Background(), req); err == nil {
+		t.Fatal("expected error")
+	}
+	testing_helper.AssertContents(t, dst, load[:10])
+	testHttpAssertModTime(t, dst, testHttpModTime)
+
+	if err := g.GetFile(context.Background(), req); err != nil {
+		t.Fatalf("err: %s", err)
+	}
+	testing_helper.AssertContents(t, dst, load)
+}
+
+// Without a Last-Modified time that is a strong validator, an existing
+// destination cannot be matched to the remote file, so it is downloaded again
+// and its modification time is not set.
+func TestHttpGetter_GetFileWeakLastModified(t *testing.T) {
+	load := testHttpMetaStr
+
+	tc := []struct {
+		name         string
+		lastModified time.Time
+		date         time.Time
+		noDate       bool
+	}{
+		{name: "none"},
+		{name: "same-second", lastModified: testHttpModTime, date: testHttpModTime},
+		{name: "no-date", lastModified: testHttpModTime, noDate: true},
+	}
+
+	for _, tt := range tc {
+		t.Run(tt.name, func(t *testing.T) {
+			dst := testHttpExistingFile(t, load[:10], testHttpModTime)
+			req := testHttpFileRequest(t, dst, func(w http.ResponseWriter, r *http.Request) {
+				// The existing file must not be resumed.
+				if r.Header.Get("Range") != "" {
+					http.Error(w, "unexpected range", http.StatusBadRequest)
+					return
+				}
+				if !tt.date.IsZero() {
+					w.Header().Set("Date", tt.date.Format(http.TimeFormat))
+				}
+				if tt.noDate {
+					w.Header()["Date"] = nil
+				}
+				http.ServeContent(w, r, "file", tt.lastModified, strings.NewReader(load))
+			})
+
+			if err := new(HttpGetter).GetFile(context.Background(), req); err != nil {
+				t.Fatalf("err: %s", err)
+			}
+			testing_helper.AssertContents(t, dst, load)
+			fi, err := os.Stat(dst)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if fi.ModTime().Equal(testHttpModTime) {
+				t.Fatal("modification time set from a weak Last-Modified")
+			}
+		})
 	}
 }
 
@@ -800,19 +1190,14 @@ func TestHttpGetter__endless_body(t *testing.T) {
 
 // MaxBytes also limits the download when a ProgressListener is set.
 func TestHttpGetter_GetFileMaxBytesProgress(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte(strings.Repeat(".", 100)))
-	}))
-	defer server.Close()
-
 	dst := filepath.Join(t.TempDir(), "file")
+	req := testHttpFileRequest(t, dst, func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(strings.Repeat(".", 100)))
+	})
 	p := &MockProgressTracking{}
+	req.ProgressListener = p
+
 	g := &HttpGetter{MaxBytes: 10, DoNotCheckHeadFirst: true}
-	req := &Request{
-		Dst:              dst,
-		u:                &url.URL{Scheme: "http", Host: server.Listener.Addr().String(), Path: "/file"},
-		ProgressListener: p,
-	}
 	err := g.GetFile(context.Background(), req)
 	if !errors.Is(err, io.ErrShortWrite) {
 		t.Fatalf("err: %v", err)
@@ -1140,21 +1525,11 @@ func testHttpHandlerNone(w http.ResponseWriter, r *http.Request) {
 }
 
 func testHttpHandlerRange(w http.ResponseWriter, r *http.Request) {
-	load := []byte(testHttpMetaStr)
-	switch r.Method {
-	case "HEAD":
-		w.Header().Add("accept-ranges", "bytes")
-		w.Header().Add("content-length", strconv.Itoa(len(load)))
-	default:
-		// request should have header "Range: bytes=0-1023"
-		// or                         "Range: bytes=123-"
-		rangeHeaderValue := strings.Split(r.Header.Get("Range"), "=")[1]
-		rng, _ := strconv.Atoi(strings.Split(rangeHeaderValue, "-")[0])
-		if rng < 1 || rng > len(load) {
-			http.Error(w, "", http.StatusBadRequest)
-		}
-		w.Write(load[rng:])
+	if r.Method == "GET" && r.Header.Get("Range") == "" {
+		http.Error(w, "range expected", http.StatusBadRequest)
+		return
 	}
+	http.ServeContent(w, r, "range", testHttpModTime, strings.NewReader(testHttpMetaStr))
 }
 
 func testHttpHandlerNoRange(w http.ResponseWriter, r *http.Request) {
@@ -1163,6 +1538,7 @@ func testHttpHandlerNoRange(w http.ResponseWriter, r *http.Request) {
 	case "HEAD":
 		// we support range, but the object size isn't known
 		w.Header().Add("accept-ranges", "bytes")
+		w.Header().Set("Last-Modified", testHttpModTime.Format(http.TimeFormat))
 	default:
 		if r.Header.Get("Range") != "" {
 			http.Error(w, "range not supported", http.StatusBadRequest)
@@ -1192,6 +1568,60 @@ func testHttpServerSubDir(t *testing.T) net.Listener {
 	go server.Serve(ln)
 
 	return ln
+}
+
+// testHttpModTime is the Last-Modified time of the files served in tests.
+var testHttpModTime = time.Date(2024, 1, 2, 3, 4, 5, 0, time.UTC)
+
+// testHttpFileRequest serves handler until the test ends, and returns a
+// request that downloads from it to dst.
+func testHttpFileRequest(t *testing.T, dst string, handler http.HandlerFunc) *Request {
+	t.Helper()
+
+	server := httptest.NewServer(handler)
+	t.Cleanup(server.Close)
+
+	return &Request{
+		Dst: dst,
+		u:   &url.URL{Scheme: "http", Host: server.Listener.Addr().String(), Path: "/file"},
+	}
+}
+
+func testHttpExistingFile(t *testing.T, content string, modTime time.Time) string {
+	t.Helper()
+
+	dst := filepath.Join(t.TempDir(), "file")
+	if err := os.WriteFile(dst, []byte(content), 0644); err != nil {
+		t.Fatalf("err: %s", err)
+	}
+	if err := os.Chtimes(dst, modTime, modTime); err != nil {
+		t.Fatalf("err: %s", err)
+	}
+	return dst
+}
+
+func testHttpAssertModTime(t *testing.T, path string, want time.Time) {
+	t.Helper()
+
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("err: %s", err)
+	}
+	if !fi.ModTime().Equal(want) {
+		t.Fatalf("bad modification time: got %s, want %s", fi.ModTime().UTC(), want.UTC())
+	}
+}
+
+func testHttpAssertNotModTime(t *testing.T, path string, notWant time.Time) {
+	t.Helper()
+
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("err: %s", err)
+	}
+	if fi.ModTime().Equal(notWant) {
+		t.Fatalf("modification time should not be %s", notWant.UTC())
+	}
 }
 
 const testHttpMetaStr = `

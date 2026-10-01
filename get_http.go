@@ -53,7 +53,8 @@ type HttpGetter struct {
 	// make(http.Header).
 	Header http.Header
 	// DoNotCheckHeadFirst configures the client to NOT check if the server
-	// supports HEAD requests.
+	// supports HEAD requests. GetFile then always downloads an existing
+	// destination again.
 	DoNotCheckHeadFirst bool
 
 	// HeadFirstTimeout configures the client to enforce a timeout when
@@ -295,11 +296,21 @@ func (g *HttpGetter) Get(ctx context.Context, req *Request) error {
 }
 
 // GetFile fetches the file from src and stores it at dst.
-// If the server supports Accept-Range, HttpGetter will attempt a range
-// request. This means it is the caller's responsibility to ensure that an
-// older version of the destination file does not exist, else it will be either
-// falsely identified as being replaced, or corrupted with extra bytes
-// appended.
+//
+// The modification time of dst is set to the Last-Modified time of the
+// remote file, when the server sends one that is a strong validator (at
+// least one second before the Date of the response). When the HEAD and GET
+// responses report different times, the earlier one is used. If dst already
+// exists with the Last-Modified time from the HEAD request, and the HEAD
+// request reports Accept-Ranges and a Content-Length, HttpGetter considers
+// dst to be (a prefix of) the same remote file: a complete dst is kept, and
+// a shorter one is resumed with a range request guarded by If-Range. In any
+// other case dst is downloaded again from the start, which includes every
+// call on a file system that stores modification times less precisely than
+// HTTP (FAT stores them in steps of two seconds).
+//
+// dst must only hold downloads of src: a file from another source with the
+// same modification time is taken for this one.
 func (g *HttpGetter) GetFile(ctx context.Context, req *Request) error {
 	// Optionally enforce a maxiumum HTTP response body size.
 	if g.MaxBytes > 0 {
@@ -328,6 +339,8 @@ func (g *HttpGetter) GetFile(ctx context.Context, req *Request) error {
 	}
 
 	var currentFileSize int64
+	var headSize int64
+	var headLastModified time.Time
 	var httpReq *http.Request
 
 	if g.DoNotCheckHeadFirst == false {
@@ -340,8 +353,9 @@ func (g *HttpGetter) GetFile(ctx context.Context, req *Request) error {
 			defer cancel()
 		}
 
-		// We first make a HEAD request so we can check
-		// if the server supports range queries. If the server/URL doesn't
+		// We first make a HEAD request so we can check if the server
+		// supports range queries, and whether the existing file matches the
+		// Last-Modified time of the remote file. If the server/URL doesn't
 		// support HEAD requests, we just fall back to GET.
 		httpReq, err = http.NewRequestWithContext(headCtx, "HEAD", req.u.String(), nil)
 		if err != nil {
@@ -354,17 +368,20 @@ func (g *HttpGetter) GetFile(ctx context.Context, req *Request) error {
 		if err == nil {
 			headResp.Body.Close()
 			if headResp.StatusCode == 200 {
-				// If the HEAD request succeeded, then attempt to set the range
-				// query if we can.
-				if headResp.Header.Get("Accept-Ranges") == "bytes" && headResp.ContentLength >= 0 {
-					if fi, err := f.Stat(); err == nil {
-						if _, err = f.Seek(0, io.SeekEnd); err == nil {
+				headSize = headResp.ContentLength
+				headLastModified = strongLastModified(headResp)
+
+				// If the HEAD request succeeded and the existing file has
+				// the Last-Modified time of the remote file, keep it when it
+				// is complete, or resume it when it is shorter.
+				if headResp.Header.Get("Accept-Ranges") == "bytes" && headSize > 0 && !headLastModified.IsZero() {
+					if fi, err := f.Stat(); err == nil && fi.ModTime().Equal(headLastModified) {
+						if fi.Size() == headSize {
+							// file already present
+							return nil
+						}
+						if fi.Size() < headSize {
 							currentFileSize = fi.Size()
-							httpReq.Header.Set("Range", fmt.Sprintf("bytes=%d-", currentFileSize))
-							if currentFileSize >= headResp.ContentLength {
-								// file already present
-								return nil
-							}
 						}
 					}
 				}
@@ -387,22 +404,81 @@ func (g *HttpGetter) GetFile(ctx context.Context, req *Request) error {
 		httpReq.Header = g.Header.Clone()
 	}
 	if currentFileSize > 0 {
+		// The remote file may change between the HEAD and this GET: If-Range
+		// makes the server send all of the new file (200) instead of a range
+		// of it.
 		httpReq.Header.Set("Range", fmt.Sprintf("bytes=%d-", currentFileSize))
+		httpReq.Header.Set("If-Range", headLastModified.UTC().Format(http.TimeFormat))
 	}
 
 	resp, err := g.Client.Do(httpReq)
 	if err != nil {
 		return err
 	}
+	lastModified := strongLastModified(resp)
+	contentLength := resp.ContentLength
 	switch resp.StatusCode {
-	case http.StatusOK, http.StatusPartialContent:
-		// all good
+	case http.StatusPartialContent:
+		// The server sends the rest of the file, from where the existing file
+		// ends, or from the start when nothing was requested. Anything else
+		// would corrupt dst, so the checks are strict.
+		var start, end, size int64
+		contentRange := resp.Header.Get("Content-Range")
+		_, err := fmt.Sscanf(contentRange, "bytes %d-%d/%d", &start, &end, &size)
+		if err != nil || start != currentFileSize || end != size-1 || (headSize > 0 && size != headSize) ||
+			(contentLength >= 0 && contentLength != end-start+1) {
+			err = fmt.Errorf("unexpected partial content: %q", contentRange)
+		} else if currentFileSize > 0 && resp.Header.Get("Last-Modified") != "" && !lastModified.Equal(headLastModified) {
+			// If-Range ties the kept bytes to headLastModified, but not every
+			// server honors it (RFC 9110, section 13.1.5).
+			err = fmt.Errorf("partial content of another remote file: Last-Modified %q", resp.Header.Get("Last-Modified"))
+		}
+		if err != nil {
+			resp.Body.Close()
+			// Drop the bytes the server will not continue, so that the next
+			// call starts over.
+			if terr := f.Truncate(0); terr != nil {
+				return terr
+			}
+			return err
+		}
+		if currentFileSize > 0 {
+			lastModified = headLastModified
+		}
+		contentLength = end - start + 1
+	case http.StatusOK:
+		// The server sends the whole file (Range was ignored, or If-Range did
+		// not match), replacing any existing content.
+		currentFileSize = 0
 	default:
 		resp.Body.Close()
 		return fmt.Errorf("bad response code: %d", resp.StatusCode)
 	}
+	// The GET may be answered by another server than the HEAD (a redirect to
+	// a CDN) that reports a later Last-Modified time for the same file. Keep
+	// the earlier time: the HEAD time lets the next call keep dst, and an
+	// earlier GET time (a stale cache) makes it download dst again.
+	if !headLastModified.IsZero() && headLastModified.Before(lastModified) {
+		lastModified = headLastModified
+	}
+	// dst may be longer than the bytes kept (stale, larger, or replaced by a
+	// 200): drop the rest before writing.
+	if err := f.Truncate(currentFileSize); err != nil {
+		resp.Body.Close()
+		return err
+	}
+	if _, err := f.Seek(currentFileSize, io.SeekStart); err != nil {
+		resp.Body.Close()
+		return err
+	}
 
 	body := resp.Body
+
+	if contentLength >= 0 && resp.ContentLength < 0 {
+		// A partial response without Content-Length must still end where its
+		// Content-Range does.
+		body = newLimitedWrappedReaderCloser(body, contentLength)
+	}
 
 	if maxBytes := httpMaxBytesFromContext(readCtx); maxBytes > 0 {
 		body = newLimitedWrappedReaderCloser(body, maxBytes)
@@ -411,15 +487,45 @@ func (g *HttpGetter) GetFile(ctx context.Context, req *Request) error {
 	if req.ProgressListener != nil {
 		// track download
 		fn := filepath.Base(req.u.EscapedPath())
-		body = req.ProgressListener.TrackProgress(fn, currentFileSize, currentFileSize+resp.ContentLength, body)
+		body = req.ProgressListener.TrackProgress(fn, currentFileSize, currentFileSize+contentLength, body)
 	}
 	defer body.Close()
 
 	n, err := Copy(readCtx, f, body)
-	if err == nil && n < resp.ContentLength {
+	if err == nil && n < contentLength {
 		err = io.ErrShortWrite
 	}
+	// Close before setting the modification time, which closing a written
+	// file may otherwise update (Windows).
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+
+	// Record which remote file the content belongs to, even when the download
+	// was interrupted, so that a later call can keep or resume it. This is best
+	// effort: without it, a later call downloads the file again. A body the
+	// Transport decompressed does not match the remote bytes, so it cannot be
+	// resumed.
+	if !lastModified.IsZero() && !resp.Uncompressed {
+		_ = os.Chtimes(req.Dst, time.Time{}, lastModified)
+	}
 	return err
+}
+
+// strongLastModified returns the Last-Modified time of resp when it is a
+// strong validator, that is at least one second before the Date of resp
+// (RFC 9110, section 8.8.2.2), and the zero time otherwise, since If-Range
+// requires a strong validator (RFC 9110, section 13.1.5).
+func strongLastModified(resp *http.Response) time.Time {
+	lastModified, err := http.ParseTime(resp.Header.Get("Last-Modified"))
+	if err != nil {
+		return time.Time{}
+	}
+	date, err := http.ParseTime(resp.Header.Get("Date"))
+	if err != nil || date.Sub(lastModified) < time.Second {
+		return time.Time{}
+	}
+	return lastModified
 }
 
 // getXTerraformSource downloads the source into the destination
