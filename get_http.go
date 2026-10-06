@@ -411,7 +411,7 @@ func (g *HttpGetter) GetFile(ctx context.Context, req *Request) error {
 	if req.ProgressListener != nil {
 		// track download
 		fn := filepath.Base(req.u.EscapedPath())
-		body = req.ProgressListener.TrackProgress(fn, currentFileSize, currentFileSize+resp.ContentLength, resp.Body)
+		body = req.ProgressListener.TrackProgress(fn, currentFileSize, currentFileSize+resp.ContentLength, body)
 	}
 	defer body.Close()
 

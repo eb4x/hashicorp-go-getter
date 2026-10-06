@@ -6,8 +6,10 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"net/http/httputil"
 	"net/url"
 	"os"
@@ -793,6 +795,31 @@ func TestHttpGetter__endless_body(t *testing.T) {
 	_, err := client.Get(ctx, &req)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+// MaxBytes also limits the download when a ProgressListener is set.
+func TestHttpGetter_GetFileMaxBytesProgress(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(strings.Repeat(".", 100)))
+	}))
+	defer server.Close()
+
+	dst := filepath.Join(t.TempDir(), "file")
+	p := &MockProgressTracking{}
+	g := &HttpGetter{MaxBytes: 10, DoNotCheckHeadFirst: true}
+	req := &Request{
+		Dst:              dst,
+		u:                &url.URL{Scheme: "http", Host: server.Listener.Addr().String(), Path: "/file"},
+		ProgressListener: p,
+	}
+	err := g.GetFile(context.Background(), req)
+	if !errors.Is(err, io.ErrShortWrite) {
+		t.Fatalf("err: %v", err)
+	}
+	testing_helper.AssertContents(t, dst, strings.Repeat(".", 10))
+	if p.downloaded["file"] != 1 {
+		t.Fatalf("progress tracked %d times, want 1", p.downloaded["file"])
 	}
 }
 
