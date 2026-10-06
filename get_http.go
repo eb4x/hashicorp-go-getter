@@ -480,7 +480,8 @@ func (g *HttpGetter) GetFile(ctx context.Context, req *Request) error {
 		body = newLimitedWrappedReaderCloser(body, contentLength)
 	}
 
-	if maxBytes := httpMaxBytesFromContext(readCtx); maxBytes > 0 {
+	maxBytes := httpMaxBytesFromContext(readCtx)
+	if maxBytes > 0 {
 		body = newLimitedWrappedReaderCloser(body, maxBytes)
 	}
 
@@ -505,8 +506,10 @@ func (g *HttpGetter) GetFile(ctx context.Context, req *Request) error {
 	// was interrupted, so that a later call can keep or resume it. This is best
 	// effort: without it, a later call downloads the file again. A body the
 	// Transport decompressed does not match the remote bytes, so it cannot be
-	// resumed.
-	if !lastModified.IsZero() && !resp.Uncompressed {
+	// resumed. Neither can a download that MaxBytes cut short: every call
+	// would add another MaxBytes to it.
+	limited := maxBytes > 0 && n >= maxBytes
+	if !lastModified.IsZero() && !resp.Uncompressed && !limited {
 		_ = os.Chtimes(req.Dst, time.Time{}, lastModified)
 	}
 	return err

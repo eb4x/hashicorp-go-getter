@@ -1208,6 +1208,46 @@ func TestHttpGetter_GetFileMaxBytesProgress(t *testing.T) {
 	}
 }
 
+// A download that MaxBytes cut short is not resumed, so repeated calls cannot
+// grow it past MaxBytes. Without a Content-Length, the cut is not an error.
+func TestHttpGetter_GetFileMaxBytesResume(t *testing.T) {
+	load := strings.Repeat(".", 100)
+
+	tc := []struct {
+		name    string
+		chunked bool
+	}{
+		{name: "content-length"},
+		{name: "chunked", chunked: true},
+	}
+
+	for _, tt := range tc {
+		t.Run(tt.name, func(t *testing.T) {
+			dst := filepath.Join(t.TempDir(), "file")
+			req := testHttpFileRequest(t, dst, func(w http.ResponseWriter, r *http.Request) {
+				if tt.chunked && r.Method == "GET" && r.Header.Get("Range") == "" {
+					w.Header().Set("Last-Modified", testHttpModTime.Format(http.TimeFormat))
+					w.WriteHeader(http.StatusOK)
+					// Send the headers without a Content-Length.
+					w.(http.Flusher).Flush()
+					w.Write([]byte(load))
+					return
+				}
+				http.ServeContent(w, r, "file", testHttpModTime, strings.NewReader(load))
+			})
+
+			g := &HttpGetter{MaxBytes: 10}
+			for i := 0; i < 2; i++ {
+				err := g.GetFile(context.Background(), req)
+				if err != nil && !errors.Is(err, io.ErrShortWrite) {
+					t.Fatalf("err: %s", err)
+				}
+				testing_helper.AssertContents(t, dst, load[:10])
+			}
+		})
+	}
+}
+
 func TestHttpGetter_subdirLink(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
