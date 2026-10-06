@@ -281,10 +281,7 @@ func TestHttpGetter_resume(t *testing.T) {
 	ln := testHttpServer(t)
 	defer ln.Close()
 
-	dst := testing_helper.TempDir(t)
-	defer os.RemoveAll(dst)
-
-	dst = filepath.Join(dst, "..", "range")
+	dst := filepath.Join(t.TempDir(), "range")
 	f, err := os.Create(dst)
 	if err != nil {
 		t.Fatalf("create: %v", err)
@@ -342,10 +339,7 @@ func TestHttpGetter_resumeNoRange(t *testing.T) {
 	ln := testHttpServer(t)
 	defer ln.Close()
 
-	dst := testing_helper.TempDir(t)
-	defer os.RemoveAll(dst)
-
-	dst = filepath.Join(dst, "..", "range")
+	dst := filepath.Join(t.TempDir(), "range")
 	f, err := os.Create(dst)
 	if err != nil {
 		t.Fatalf("create: %v", err)
