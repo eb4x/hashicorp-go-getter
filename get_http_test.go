@@ -391,6 +391,7 @@ func TestHttpGetter_GetFileExisting(t *testing.T) {
 		existingTime time.Time
 		noHead       bool
 		emptyHead    bool
+		etag         string
 		noGet        bool
 		wantRange    string
 		wantIfRange  string
@@ -398,6 +399,8 @@ func TestHttpGetter_GetFileExisting(t *testing.T) {
 		{name: "current", existing: load, existingTime: testHttpModTime, noGet: true},
 		{name: "current-empty-head", existing: "", existingTime: testHttpModTime, emptyHead: true},
 		{name: "current-prefix", existing: load[:10], existingTime: testHttpModTime, wantRange: "bytes=10-", wantIfRange: testHttpModTime.Format(http.TimeFormat)},
+		{name: "current-prefix-etag", existing: load[:10], existingTime: testHttpModTime, etag: `"v1"`, wantRange: "bytes=10-", wantIfRange: `"v1"`},
+		{name: "current-prefix-weak-etag", existing: load[:10], existingTime: testHttpModTime, etag: `W/"v1"`, wantRange: "bytes=10-", wantIfRange: testHttpModTime.Format(http.TimeFormat)},
 		{name: "stale-prefix", existing: "xxxxxxxxxx", existingTime: staleTime},
 		{name: "stale-same-size", existing: strings.Repeat("x", len(load)), existingTime: staleTime},
 		{name: "stale-larger", existing: load + "trailing", existingTime: staleTime},
@@ -422,6 +425,9 @@ func TestHttpGetter_GetFileExisting(t *testing.T) {
 					w.Header().Set("Last-Modified", testHttpModTime.Format(http.TimeFormat))
 					w.Header().Set("Content-Length", "0")
 					return
+				}
+				if tt.etag != "" {
+					w.Header().Set("ETag", tt.etag)
 				}
 				http.ServeContent(w, r, "file", testHttpModTime, strings.NewReader(load))
 			})
@@ -487,12 +493,14 @@ func TestHttpGetter_GetFilePartialContent(t *testing.T) {
 		body         string
 		lastModified string
 		date         string
+		etag         string
 		chunked      bool
 		errExpected  bool
 		stamped      bool
 	}{
 		{name: "resume", existing: load[:10], contentRange: rest, body: load[10:], stamped: true},
 		{name: "resume-same-last-modified", existing: load[:10], contentRange: rest, body: load[10:], lastModified: testHttpModTime.Format(http.TimeFormat), stamped: true},
+		{name: "resume-same-etag", existing: load[:10], contentRange: rest, body: load[10:], etag: `"v1"`, stamped: true},
 		{name: "resume-chunked-long", existing: load[:10], contentRange: rest, body: load[10:] + "xxx", chunked: true, stamped: true},
 		{name: "whole-file", contentRange: fmt.Sprintf("bytes 0-%d/%d", n-1, n), body: load},
 		{name: "wrong-start", existing: load[:10], contentRange: fmt.Sprintf("bytes 5-%d/%d", n-1, n), body: load[5:], errExpected: true},
@@ -502,6 +510,7 @@ func TestHttpGetter_GetFilePartialContent(t *testing.T) {
 		{name: "unknown-size", existing: load[:10], contentRange: fmt.Sprintf("bytes 10-%d/*", n-1), body: load[10:], errExpected: true},
 		{name: "other-last-modified", existing: load[:10], contentRange: rest, body: load[10:], lastModified: otherTime, errExpected: true},
 		{name: "weak-last-modified", existing: load[:10], contentRange: rest, body: load[10:], lastModified: otherTime, date: otherTime, errExpected: true},
+		{name: "other-etag", existing: load[:10], contentRange: rest, body: load[10:], etag: `"v2"`, errExpected: true},
 	}
 
 	for _, tt := range tc {
@@ -509,11 +518,15 @@ func TestHttpGetter_GetFilePartialContent(t *testing.T) {
 			dst := testHttpExistingFile(t, tt.existing, testHttpModTime)
 			req := testHttpFileRequest(t, dst, func(w http.ResponseWriter, r *http.Request) {
 				if r.Method == "HEAD" {
+					w.Header().Set("ETag", `"v1"`)
 					http.ServeContent(w, r, "file", testHttpModTime, strings.NewReader(load))
 					return
 				}
 				if tt.lastModified != "" {
 					w.Header().Set("Last-Modified", tt.lastModified)
+				}
+				if tt.etag != "" {
+					w.Header().Set("ETag", tt.etag)
 				}
 				if tt.date != "" {
 					w.Header().Set("Date", tt.date)
@@ -597,6 +610,29 @@ func TestHttpGetter_GetFileChanged(t *testing.T) {
 	}
 	testing_helper.AssertContents(t, dst, newLoad)
 	testHttpAssertModTime(t, dst, testHttpModTime)
+}
+
+// A remote file that changes but keeps its Last-Modified time is downloaded
+// again when the server sends a strong ETag.
+func TestHttpGetter_GetFileChangedSameLastModified(t *testing.T) {
+	oldLoad := testHttpMetaStr
+	newLoad := strings.ToUpper(testHttpMetaStr)
+
+	dst := testHttpExistingFile(t, oldLoad[:10], testHttpModTime)
+	req := testHttpFileRequest(t, dst, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == "HEAD" {
+			w.Header().Set("ETag", `"v1"`)
+			http.ServeContent(w, r, "file", testHttpModTime, strings.NewReader(oldLoad))
+			return
+		}
+		w.Header().Set("ETag", `"v2"`)
+		http.ServeContent(w, r, "file", testHttpModTime, strings.NewReader(newLoad))
+	})
+
+	if err := new(HttpGetter).GetFile(context.Background(), req); err != nil {
+		t.Fatalf("err: %s", err)
+	}
+	testing_helper.AssertContents(t, dst, newLoad)
 }
 
 // The GET request may be redirected to another server (a CDN) that reports

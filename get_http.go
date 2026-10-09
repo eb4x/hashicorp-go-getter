@@ -304,13 +304,17 @@ func (g *HttpGetter) Get(ctx context.Context, req *Request) error {
 // exists with the Last-Modified time from the HEAD request, and the HEAD
 // request reports Accept-Ranges and a Content-Length, HttpGetter considers
 // dst to be (a prefix of) the same remote file: a complete dst is kept, and
-// a shorter one is resumed with a range request guarded by If-Range. In any
-// other case dst is downloaded again from the start, which includes every
-// call on a file system that stores modification times less precisely than
-// HTTP (FAT stores them in steps of two seconds).
+// a shorter one is resumed with a range request guarded by If-Range, which
+// carries the strong ETag of the HEAD response if there is one, and its
+// Last-Modified time otherwise. In any other case dst is downloaded again
+// from the start, which includes every call on a file system that stores
+// modification times less precisely than HTTP (FAT stores them in steps of
+// two seconds).
 //
 // dst must only hold downloads of src: a file from another source with the
-// same modification time is taken for this one.
+// same modification time is taken for this one. Likewise, a complete dst is
+// kept when the remote file changes but keeps its Last-Modified time, as
+// with servers that give every file a fixed time.
 func (g *HttpGetter) GetFile(ctx context.Context, req *Request) error {
 	// Optionally enforce a maxiumum HTTP response body size.
 	if g.MaxBytes > 0 {
@@ -341,6 +345,7 @@ func (g *HttpGetter) GetFile(ctx context.Context, req *Request) error {
 	var currentFileSize int64
 	var headSize int64
 	var headLastModified time.Time
+	var headETag string
 	var httpReq *http.Request
 
 	if g.DoNotCheckHeadFirst == false {
@@ -370,6 +375,7 @@ func (g *HttpGetter) GetFile(ctx context.Context, req *Request) error {
 			if headResp.StatusCode == 200 {
 				headSize = headResp.ContentLength
 				headLastModified = strongLastModified(headResp)
+				headETag = strongETag(headResp)
 
 				// If the HEAD request succeeded and the existing file has
 				// the Last-Modified time of the remote file, keep it when it
@@ -406,9 +412,14 @@ func (g *HttpGetter) GetFile(ctx context.Context, req *Request) error {
 	if currentFileSize > 0 {
 		// The remote file may change between the HEAD and this GET: If-Range
 		// makes the server send all of the new file (200) instead of a range
-		// of it.
+		// of it. A strong ETag also catches a change that keeps the
+		// Last-Modified time.
+		ifRange := headLastModified.UTC().Format(http.TimeFormat)
+		if headETag != "" {
+			ifRange = headETag
+		}
 		httpReq.Header.Set("Range", fmt.Sprintf("bytes=%d-", currentFileSize))
-		httpReq.Header.Set("If-Range", headLastModified.UTC().Format(http.TimeFormat))
+		httpReq.Header.Set("If-Range", ifRange)
 	}
 
 	resp, err := g.Client.Do(httpReq)
@@ -429,9 +440,11 @@ func (g *HttpGetter) GetFile(ctx context.Context, req *Request) error {
 			(contentLength >= 0 && contentLength != end-start+1) {
 			err = fmt.Errorf("unexpected partial content: %q", contentRange)
 		} else if currentFileSize > 0 && resp.Header.Get("Last-Modified") != "" && !lastModified.Equal(headLastModified) {
-			// If-Range ties the kept bytes to headLastModified, but not every
+			// If-Range ties the kept bytes to the HEAD response, but not every
 			// server honors it (RFC 9110, section 13.1.5).
 			err = fmt.Errorf("partial content of another remote file: Last-Modified %q", resp.Header.Get("Last-Modified"))
+		} else if currentFileSize > 0 && headETag != "" && resp.Header.Get("ETag") != "" && resp.Header.Get("ETag") != headETag {
+			err = fmt.Errorf("partial content of another remote file: ETag %q", resp.Header.Get("ETag"))
 		}
 		if err != nil {
 			resp.Body.Close()
@@ -529,6 +542,16 @@ func strongLastModified(resp *http.Response) time.Time {
 		return time.Time{}
 	}
 	return lastModified
+}
+
+// strongETag returns the ETag of resp when it is a strong validator, which
+// If-Range requires (RFC 9110, section 13.1.5), and "" otherwise.
+func strongETag(resp *http.Response) string {
+	etag := resp.Header.Get("ETag")
+	if len(etag) < 2 || etag[0] != '"' || etag[len(etag)-1] != '"' {
+		return ""
+	}
+	return etag
 }
 
 // getXTerraformSource downloads the source into the destination
